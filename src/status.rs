@@ -53,6 +53,7 @@ async fn test_random_stream(state: &LState) -> Result<()> {
         sid: StreamID::Live(login),
         query: query.into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
         user_agent,
+        self_base: None,
     };
     match crate::process(pd, state).await {
         Ok(_) => Ok(()),

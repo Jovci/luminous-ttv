@@ -11,6 +11,7 @@ use axum::{
     body::Body,
     error_handling::HandleErrorLayer,
     extract::{Path, Query, State},
+    http::HeaderMap,
     response::IntoResponse,
     routing::get,
 };
@@ -20,7 +21,7 @@ use clap::Parser;
 use extend::ext;
 use http::{
     HeaderValue, Response, StatusCode,
-    header::{CACHE_CONTROL, USER_AGENT},
+    header::{CACHE_CONTROL, HOST, USER_AGENT},
 };
 use rand::distr::Alphanumeric;
 use rand::{RngExt, rng};
@@ -52,6 +53,10 @@ const LIVE_TTVLOL_ENDPOINT: &str = const_format::concatcp!("/playlist/{", ID_PAR
 // for Firefox only
 const STATUS_ENDPOINT: &str = "/stat/";
 const STATUS_TTVLOL_ENDPOINT: &str = "/ping"; // no trailing slash
+/// Media (variant) playlists, fetched through the proxy. Twitch decides whether to stitch ads
+/// into a media playlist based on who requests it, not only on the token from the master playlist.
+const MEDIA_PLAYLIST_ENDPOINT: &str = "/mpl";
+const MEDIA_PLAYLIST_PARAM: &str = "u";
 const CONCURRENCY_LIMIT: usize = 64;
 
 #[derive(Parser, Debug)]
@@ -119,6 +124,10 @@ pub(crate) struct Opts {
     /// copy-or-default system.
     #[arg(short, long, env = "LUMINOUS_TTV_USER_AGENT")]
     user_agent: Option<HeaderValue>,
+    /// Return master playlists as-is, letting the client fetch media playlists directly from
+    /// Twitch. Twitch may then stitch ads into them based on the client's IP.
+    #[arg(long, env = "LUMINOUS_TTV_NO_MEDIA_PROXY")]
+    no_media_proxy: bool,
 }
 
 // The "kimne..." client ID is shown in the clear if you load the main page.
@@ -161,12 +170,14 @@ async fn main() -> Result<()> {
         client,
         twitch_client_id: Box::leak(opts.twitch_client_id.into_boxed_str()),
         user_agent: opts.user_agent,
+        media_proxy: !opts.no_media_proxy,
     };
     #[cfg(feature = "true-status")]
     let state = LState {
         client,
         twitch_client_id: Box::leak(opts.twitch_client_id.into_boxed_str()),
         user_agent: opts.user_agent,
+        media_proxy: !opts.no_media_proxy,
         proxy,
     };
     // TODO: Find some better way to do this
@@ -175,7 +186,8 @@ async fn main() -> Result<()> {
     let mut router = Router::new()
         .route(VOD_ENDPOINT, get(process_vod))
         .route(LIVE_ENDPOINT, get(process_live))
-        .route(LIVE_TTVLOL_ENDPOINT, get(process_live));
+        .route(LIVE_TTVLOL_ENDPOINT, get(process_live))
+        .route(MEDIA_PLAYLIST_ENDPOINT, get(process_media_playlist));
     #[cfg(feature = "true-status")]
     {
         router =
@@ -228,6 +240,7 @@ struct LState {
     twitch_client_id: &'static str,
     // changing CID during operation isn't supported, so just leak it as a pointless optimization
     user_agent: Option<HeaderValue>,
+    media_proxy: bool,
     #[cfg(feature = "true-status")]
     proxy: Option<Proxy>,
 }
@@ -303,6 +316,9 @@ pub(crate) struct ProcessData {
     sid: StreamID,
     query: HashMap<String, String>,
     user_agent: UserAgent,
+    /// Base URL of this server as seen by the client, used to route media playlists through it.
+    /// `None` leaves media playlist URLs pointing at Twitch.
+    self_base: Option<String>,
 }
 
 impl ProcessData {
@@ -310,7 +326,8 @@ impl ProcessData {
         id: String,
         query: HashMap<String, String>,
         ua: Option<TypedHeader<UserAgent>>,
-        ua_override: Option<&HeaderValue>,
+        state: &LState,
+        headers: &HeaderMap,
         enum_type: F,
     ) -> AppResult<Self> {
         let (id, query) = if let Some((id, query)) = id.split_once(".m3u8?") {
@@ -325,8 +342,9 @@ impl ProcessData {
             // normal path
             (id.into_ascii_lowercase(), query)
         };
-        let user_agent = common::get_user_agent(ua, ua_override)?;
-        Ok(Self { sid: enum_type(id), query, user_agent })
+        let user_agent = common::get_user_agent(ua, state.user_agent.as_ref())?;
+        let self_base = if state.media_proxy { self_base(headers) } else { None };
+        Ok(Self { sid: enum_type(id), query, user_agent, self_base })
     }
 }
 
@@ -338,13 +356,25 @@ impl ProcessData {
 
 type QueryMap = Query<HashMap<String, String>>;
 
+/// Work out the URL the client used to reach this server, from the Host header.
+fn self_base(headers: &HeaderMap) -> Option<String> {
+    let host = headers.get(HOST)?.to_str().ok()?;
+    let scheme = headers
+        .get("X-Forwarded-Proto")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| matches!(*v, "http" | "https"))
+        .unwrap_or("http");
+    Some(format!("{scheme}://{host}"))
+}
+
 async fn process_live(
     Path(id): Path<String>,
     Query(query): QueryMap,
     ua: Option<TypedHeader<UserAgent>>,
+    headers: HeaderMap,
     State(state): State<LState>,
 ) -> Response<Body> {
-    let pd = match ProcessData::build(id, query, ua, state.user_agent.as_ref(), StreamID::Live) {
+    let pd = match ProcessData::build(id, query, ua, &state, &headers, StreamID::Live) {
         Ok(pd) => pd,
         Err(e) => return e.into_response(),
     };
@@ -355,9 +385,10 @@ async fn process_vod(
     Path(id): Path<String>,
     Query(query): QueryMap,
     ua: Option<TypedHeader<UserAgent>>,
+    headers: HeaderMap,
     State(state): State<LState>,
 ) -> Response<Body> {
-    let pd = match ProcessData::build(id, query, ua, state.user_agent.as_ref(), StreamID::VOD) {
+    let pd = match ProcessData::build(id, query, ua, &state, &headers, StreamID::VOD) {
         Ok(pd) => pd,
         Err(e) => return e.into_response(),
     };
@@ -371,8 +402,74 @@ async fn process_vod(
 
 pub(crate) async fn process(pd: ProcessData, state: &LState) -> AppResult<Response<Body>> {
     let token = get_token(state, &pd).await?;
-    let m3u8 = get_m3u8(&state.client, &pd, token.data.playback_access_token).await?;
+    let mut m3u8 = get_m3u8(&state.client, &pd, token.data.playback_access_token).await?;
+    if let Some(base) = &pd.self_base {
+        m3u8 = rewrite_media_playlists(&m3u8, base);
+    }
     Ok(([("Content-Type", "application/vnd.apple.mpegurl")], m3u8).into_response())
+}
+
+/// Point every Twitch media playlist URL in a master playlist at this server.
+fn rewrite_media_playlists(master: &str, base: &str) -> String {
+    let mut out = String::with_capacity(master.len() * 2);
+    for line in master.lines() {
+        if !line.starts_with('#') && is_twitch_playlist_url(line) {
+            let mut url = Url::parse(&format!("{base}{MEDIA_PLAYLIST_ENDPOINT}"))
+                .expect("base from Host header is a valid URL");
+            url.query_pairs_mut().append_pair(MEDIA_PLAYLIST_PARAM, line);
+            out.push_str(url.as_str());
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Only Twitch's own playlist hosts may be fetched through `/mpl`, so it can't be used as an
+/// open proxy.
+fn is_twitch_playlist_url(s: &str) -> bool {
+    let Ok(url) = Url::parse(s) else { return false };
+    url.scheme() == "https"
+        && url.path().ends_with(".m3u8")
+        && url
+            .host_str()
+            .is_some_and(|h| h.ends_with(".ttvnw.net") || h.ends_with(".live-video.net"))
+}
+
+async fn process_media_playlist(
+    Query(query): QueryMap,
+    ua: Option<TypedHeader<UserAgent>>,
+    State(state): State<LState>,
+) -> Response<Body> {
+    let Some(target) = query.get(MEDIA_PLAYLIST_PARAM).filter(|u| is_twitch_playlist_url(u)) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let user_agent = match common::get_user_agent(ua, state.user_agent.as_ref()) {
+        Ok(ua) => ua,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    let result: Result<String> = async {
+        Ok(state
+            .client
+            .get(target.as_str())
+            .header(USER_AGENT, user_agent.as_str())
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?)
+    }
+    .await;
+    match result {
+        Ok(m3u) => {
+            if m3u.contains("stitched") {
+                warn!("Twitch stitched an ad into a media playlist fetched through the proxy");
+            }
+            ([("Content-Type", "application/vnd.apple.mpegurl")], m3u).into_response()
+        }
+        Err(e) => AppError::from(e).into_response(),
+    }
 }
 
 async fn get_m3u8(client: &Client, pd: &ProcessData, token: PlaybackAccessToken) -> Result<String> {
@@ -608,7 +705,26 @@ async fn handle_error(error: BoxError) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use crate::{redact_ip, strExt};
+    use crate::{is_twitch_playlist_url, redact_ip, rewrite_media_playlists, strExt};
+
+    #[test]
+    fn media_playlist_rewrite() {
+        let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nhttps://euc11.playlist.ttvnw.net/v1/playlist/abc.m3u8\n";
+        let out = rewrite_media_playlists(master, "http://localhost:9595");
+        assert!(out.contains(
+            "http://localhost:9595/mpl?u=https%3A%2F%2Feuc11.playlist.ttvnw.net%2Fv1%2Fplaylist%2Fabc.m3u8"
+        ));
+        assert!(out.starts_with("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\n"));
+    }
+
+    #[test]
+    fn media_playlist_host_allowlist() {
+        assert!(is_twitch_playlist_url("https://euc11.playlist.ttvnw.net/v1/playlist/abc.m3u8"));
+        assert!(!is_twitch_playlist_url("https://evil.example/x.m3u8"));
+        assert!(!is_twitch_playlist_url("https://ttvnw.net.evil.example/x.m3u8"));
+        assert!(!is_twitch_playlist_url("http://euc11.playlist.ttvnw.net/v1/playlist/abc.m3u8"));
+        assert!(!is_twitch_playlist_url("https://video-weaver.ttvnw.net/secret"));
+    }
 
     #[test]
     fn substring() {
